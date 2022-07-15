@@ -1,0 +1,312 @@
+- name: Prepare custom image
+  hosts: localhost
+  gather_facts: false
+  tasks:
+
+    - name: Create working directory
+      file:
+        path: "{{ working_dir }}"
+        state: directory
+
+    - name: Check if Ubuntu ISO exists locally
+      stat:
+        path: "{{ tmp_dir }}/{{ ubuntu_iso }}"
+      register: InstallerFileCheck
+
+    - name: Download Ubuntu ISO
+      get_url:
+        url:  "{{ ubuntu_iso_url }}/{{ ubuntu_iso }}"
+        dest: "{{ tmp_dir }}/{{ ubuntu_iso }}"
+      when:
+        - InstallerFileCheck.stat.exists != true
+
+    - name: Mount Ubuntu ISO
+      mount:
+        path:   "{{ working_dir }}/iso"
+        src:    "{{ tmp_dir }}/{{ ubuntu_iso }}"
+        fstype: iso9660
+        opts:   ro,noauto
+        state:  mounted
+      become: yes
+      become_method: sudo
+
+    - name: Copy txt.cfg from Ubuntu ISO
+      copy: 
+        src: "{{ working_dir }}/iso/isolinux/txt.cfg"
+        dest: "{{ working_dir }}/isocopy/isolinux/"
+        mode: "666"
+
+    - name: Modify line in txt.cfg 
+      replace:
+        dest: "{{ working_dir }}/isocopy/isolinux/txt.cfg"
+        regexp: 'append   initrd=/casper/initrd quiet  ---'
+        replace: 'append   initrd=/casper/initrd quiet --- autoinstall ds=nocloud;s=/cdrom/autoinstall/'
+
+    - name: Create directory to store user-data and meta-data
+      file:
+        path: "{{ working_dir }}/isocopy/autoinstall"
+        state: directory
+
+    - name: Process user-data template to directory
+      template:
+        src: ./templates/user-data.j2
+        dest: "{{ working_dir }}/isocopy/autoinstall/user-data"
+        mode: "666"
+      tags: userdata
+
+    - name: Create empty meta-data file in directory
+      ansible.builtin.file:
+        path: "{{ working_dir }}/isocopy/autoinstall/meta-data"
+        state: touch
+        mode: "666"
+
+    - name: Create custom Ubuntu ISO
+      command: "xorrisofs -relaxed-filenames -J -R -o {{ tmp_dir }}/{{ ubuntu_iso_custom }} -b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table {{ working_dir }}/iso/ {{ working_dir }}/isocopy/"
+      args:
+        chdir: "{{ working_dir }}/isocopy/"
+
+    - name: Unmount Ubuntu ISO
+      mount:
+        path:   "{{ working_dir }}/iso"
+        src:    "{{ tmp_dir }}/{{ ubuntu_iso }}"
+        fstype: iso9660
+        opts:   ro,noauto
+        state:  absent
+      become: yes
+      become_method: sudo
+
+
+- name: Prepare and create VMs
+  hosts: vmhosts:!vmguests
+  gather_facts: false
+  tasks:
+
+    - name: Upload custom Ubuntu ISO to the VMWare datastore
+      vsphere_copy:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        validate_certs: no
+        datacenter: "{{ hostvars[inventory_hostname].datacenter }}"
+        src:       "{{ tmp_dir }}/{{ ubuntu_iso_custom }}" 
+        datastore: "{{ hostvars[inventory_hostname].datastore }}"
+        path: "{{ hostvars[inventory_hostname].isos_dir }}/{{ ubuntu_iso_custom }}"
+      delegate_to: localhost
+
+    - name: Create a virtual machine on given ESXi hostnames
+      vmware_guest:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        validate_certs: no
+        datacenter: "{{ hostvars[inventory_hostname].datacenter }}"
+        folder: ""
+        name: "{{ item }}"
+        state: poweredon
+        guest_id: ubuntu64Guest
+        disk:
+        - size_gb: "{{ hostvars[item].disk_size }}"
+          type: thin
+          datastore: "{{ hostvars[inventory_hostname].datastore }}"
+        hardware:
+          memory_mb: "{{ hostvars[item].memory }}"
+          num_cpus: "{{ hostvars[item].cpus }}"
+          scsi: paravirtual
+        networks:
+        - name: VM Network
+#          ip: "{{ hostvars[item].ansible_host }}"
+#          netmask: "{{ hostvars[item].net_prefix }}"
+          device_type: vmxnet3
+        cdrom:
+          - controller_number: 0
+            unit_number: 0
+            state: present
+            type: iso
+            iso_path: "[{{ hostvars[inventory_hostname].datastore }}] {{ hostvars[inventory_hostname].isos_dir }}/{{ ubuntu_iso_custom }}"
+#        wait_for_ip_address: yes
+      delegate_to: localhost
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      tags: 
+        - vm_create
+        - set_vms
+
+    - name: Check if the Ubuntu VM are ready
+      vmware_guest_info:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        datacenter: "{{ hostvars[inventory_hostname].datacenter }}"
+        validate_certs: no
+        name: "{{ item }}"
+        schema: vsphere
+      register: vm_facts
+      delegate_to: localhost
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      until: vm_facts.instance.guest.hostName is search(default_hostname)
+      retries: 30
+      delay: 60
+      tags: 
+        - is_vms_up
+        - set_vms
+
+# This check works for determination of guest OS was booted from its own HD not from CDROM
+# I discovered that when VM was booted it's diskPaths are changed right before you can start using it's shell.
+# I didn't find any other ways for this check. There is no return codes from commands executed vm_shell
+
+    - name: Check if the Ubuntu VM booted from HD
+      vmware_guest_info:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        datacenter: "{{ hostvars[inventory_hostname].datacenter }}"
+        validate_certs: no
+        name: "{{ item }}"
+        schema: vsphere
+      register: vm_facts
+      delegate_to: localhost
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      until: vm_facts.instance.guest.disk is not search("/target/boot") and vm_facts.instance.guest.disk is search("/boot")
+      retries: 60
+      delay: 10
+      tags: 
+        - is_hd_booted
+        - set_vms
+
+    - name: Take vm_facts
+      vmware_guest_info:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        datacenter: "{{ hostvars[inventory_hostname].datacenter }}"
+        validate_certs: no
+        name: "{{ item }}"
+        schema: vsphere
+      register: vm_facts
+      delegate_to: localhost
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      tags: 
+        - facts
+        - never
+
+    - debug:
+        msg="{{vm_facts}}"
+      tags:
+        - facts
+        - never
+
+    - name: Change hostname
+      vmware_vm_shell:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        datacenter: "{{ hostvars[inventory_hostname].datacenter }}"
+        validate_certs: no
+        vm_id: "{{ item }}"
+        vm_username: "{{ ansible_ssh_user }}"
+        vm_password: "{{ ansible_ssh_pass }}"
+        vm_shell: "/usr/bin/sudo"
+        vm_shell_args: "/usr/bin/hostnamectl set-hostname '{{ item }}'"
+      delegate_to: localhost
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      tags: 
+        - change_hostname
+        - set_vms
+
+    - name: Create directories for netplan configurations
+      file:
+        path: "{{ working_dir }}/{{ inventory_hostname }}/{{ item }}"
+        state: directory
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      delegate_to: localhost
+      tags:
+        - netplan
+
+    - name: Process VM network configuration
+      template: 
+        src: ./templates/netplan.j2
+        dest: "{{ working_dir }}/{{ inventory_hostname }}/{{ item }}/00-installer-config.yaml"
+        mode: "666"
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      delegate_to: localhost
+      tags:
+        - netplan
+        - netplan_cfg
+
+    - name: Copy network configuration file to Ubuntu VM
+      vmware_guest_file_operation:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        validate_certs: no
+        vm_id: "{{ item }}"
+        vm_username: "{{ ansible_ssh_user }}"
+        vm_password: "{{ ansible_ssh_pass }}"
+        copy:
+            src: "{{ working_dir }}/{{ inventory_hostname }}/{{ item }}/00-installer-config.yaml"
+            dest: "/home/{{ ansible_ssh_user }}/00-installer-config.yaml"
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      delegate_to: localhost
+      tags:
+        - netplan
+
+    - name: Move network configuration file to right location on Ubuntu VM
+      vmware_vm_shell:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        validate_certs: no
+        vm_id: "{{ item }}"
+        vm_username: "{{ ansible_ssh_user }}"
+        vm_password: "{{ ansible_ssh_pass }}"
+        vm_shell: /usr/bin/sudo
+        vm_shell_args: "install -o root -g root -m 644 /home/{{ ansible_ssh_user }}/00-installer-config.yaml /etc/netplan/00-installer-config.yaml"
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      delegate_to: localhost
+      tags:
+        - netplan
+
+    - name: Appply the network configuration on Ubuntu VM
+      vmware_vm_shell:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        validate_certs: no
+        vm_id: "{{ item }}"
+        vm_username: "{{ ansible_ssh_user }}"
+        vm_password: "{{ ansible_ssh_pass }}"
+        vm_shell: /usr/bin/sudo
+        vm_shell_args: netplan apply
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      delegate_to: localhost
+      tags:
+        - netplan
+
+    - name: Set new password for the Ubuntu user
+      vmware_vm_shell:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ hostvars[inventory_hostname].esxi_username }}"
+        password: "{{ hostvars[inventory_hostname].esxi_password }}"
+        datacenter: "{{ hostvars[inventory_hostname].datacenter }}"
+        validate_certs: no
+        vm_id: "{{ item }}"
+        vm_username: "{{ ansible_ssh_user }}"
+        vm_password: "{{ ansible_ssh_pass }}"
+        vm_shell: /usr/bin/echo
+        vm_shell_args: "'{{ ansible_ssh_user }}:{{ hostvars[item].new_default_user_password }}' | sudo chpasswd"
+      register: vm_facts
+      delegate_to: localhost
+      with_items: "{{ groups[hostvars[inventory_hostname].vmgroup] }}"
+      tags:
+        - never
+
+
+- name: Working with guests OS
+  hosts: vmguests
+  gather_facts: false
+  tasks:
+
+   - name: Check hostname from the inside
+     command: hostname
+     tags:
+       - check_guests
+

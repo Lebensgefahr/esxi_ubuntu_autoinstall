@@ -1,0 +1,76 @@
+all:
+  vars:
+    default_hostname: server
+    ansible_ssh_user: user
+    ansible_ssh_pass: P@SSWORD
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+
+    tmp_dir: /tmp
+    working_dir: /tmp/ubuntu20
+    ubuntu_iso: ubuntu-20.04.4-live-server-amd64.iso
+    ubuntu_iso_url: https://releases.ubuntu.com/20.04.4
+    ubuntu_iso_custom: ubuntu.iso
+
+  children:
+    vmhosts:
+      children:
+        vmhost1:
+          hosts:
+            192.168.252.80:
+              esxi_username: root
+              esxi_password: P@SSWORD
+              datacenter: ha-datacenter
+              datastore: datastore1
+              isos_dir: isos
+              vmgroup: vmguests1
+          children:
+            vmguests:
+              children:
+                vmguests1:
+                  hosts:
+                    ubuntu1:
+                      ansible_host: 192.168.252.149
+                      disk_size: 20
+                      memory: 2048
+                      cpus: 2
+                      net_prefix: 24
+                      gateway: 192.168.252.1
+                      new_default_user_password: 123
+                    ubuntu2:
+                      ansible_host: 192.168.252.150
+                      disk_size: 30
+                      memory: 1024
+                      cpus: 1
+                      net_prefix: 24
+                      gateway: 192.168.252.1
+                      new_default_user_password: 123
+        vmhost2:
+          hosts:
+            192.168.252.81:
+              esxi_username: root
+              esxi_password: P@SSWORD
+              datacenter: ha-datacenter
+              datastore: datastore1
+              isos_dir: isos
+              vmgroup: vmguests1
+          children:
+            vmguests:
+              children:
+                vmguests1:
+                  hosts:
+                    ubuntu3:
+                      ansible_host: 192.168.252.102
+                      disk_size: 20
+                      memory: 2048
+                      cpus: 2
+                      net_prefix: 24
+                      gateway: 192.168.252.1
+                      new_default_user_password: 123
+                    ubuntu4:
+                      ansible_host: 192.168.252.109
+                      disk_size: 30
+                      memory: 1024
+                      cpus: 1
+                      net_prefix: 24
+                      gateway: 192.168.252.1
+                      new_default_user_password: 123

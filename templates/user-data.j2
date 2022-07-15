@@ -1,0 +1,13 @@
+#cloud-config
+autoinstall:
+  version: 1
+  identity:
+    hostname: {{ default_hostname }}
+    username: {{ ansible_ssh_user }}
+    password: {{ ansible_ssh_pass | password_hash('sha512') }}
+  ssh:
+    install-server: yes
+  packages:
+    - open-vm-tools # for vmware hypervisor
+  late-commands:
+    - echo '{{ ansible_ssh_user }} ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/{{ ansible_ssh_user }} # Allow user to run sudo without password

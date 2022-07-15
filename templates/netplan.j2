@@ -1,0 +1,11 @@
+network:
+  ethernets:
+    ens192:
+      addresses:
+        - {{ hostvars[item].ansible_host }}/{{ hostvars[item].net_prefix }}
+      gateway4: {{ hostvars[item].gateway }}
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 8.8.4.4
+  version: 2
